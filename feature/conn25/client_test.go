@@ -5,13 +5,16 @@ package conn25
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
 	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
@@ -345,7 +348,7 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 	tests := []struct {
 		name                    string
 		flowsAndTimeFx          func(*Conn25, *tstest.Clock, netip.Addr)
-		secondDNSResponse       []byte
+		secondDNSResponse       *resolver.Response
 		assertSecondDNSResponse func(*testing.T, []byte)
 		wantUnexpiredDstIPs     set.Set[netip.Addr]
 		wantExpiredAtTime       map[netip.Addr]time.Duration // since the startTime
@@ -497,4 +500,53 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResendTransitIPMappingConcurrent races resendTransitIPMapping, against a writer of client.assignments.
+func TestResendTransitIPMappingConcurrent(t *testing.T) {
+	const appName = "a"
+	conn25 := newConn25(logger.Discard)
+	c := conn25.client
+
+	// A mapping for the resending goroutine to find, so it takes the found
+	// path and copies *addrs rather than returning early on the miss.
+	knownTransit := netip.MustParseAddr("169.254.255.255")
+	if err := c.assignments.insert(&addrs{
+		dst:     netip.MustParseAddr("1.2.3.4"),
+		magic:   netip.MustParseAddr("100.64.255.255"),
+		transit: knownTransit,
+		app:     appName,
+		domain:  "example.com.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const iters = 2000
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range iters {
+			as := &addrs{
+				dst:     netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1}),
+				magic:   netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}),
+				transit: netip.AddrFrom4([4]byte{169, 254, byte(i >> 8), byte(i)}),
+				app:     appName,
+				domain:  must.Get(dnsname.ToFQDN(fmt.Sprintf("h%d.example.com.", i))),
+			}
+			// insert writes the maps resendTransitIPMapping reads, so hold
+			// c.mu around it exactly as the production writers do.
+			c.mu.Lock()
+			err := c.assignments.insert(as)
+			c.mu.Unlock()
+			if err != nil {
+				t.Errorf("insert(%v): %v", as.domain, err)
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		for range iters {
+			c.resendTransitIPMapping(knownTransit)
+		}
+	})
+	wg.Wait()
 }

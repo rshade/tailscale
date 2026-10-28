@@ -31,6 +31,7 @@ import (
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/traffic"
 	"tailscale.com/net/tsaddr"
@@ -162,12 +163,12 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 	if !ok {
 		return errors.New("could not access system tun")
 	}
-	resolver := dnsManager.Resolver()
-	if resolver == nil {
+	r := dnsManager.Resolver()
+	if r == nil {
 		return errors.New("dns manager resolver not ready")
 	}
 
-	if err := resolver.RegisterCustomScheme(appc.DNSAddrScheme, func(addr string) (string, error) {
+	if err := r.RegisterCustomScheme(appc.DNSAddrScheme, func(addr string) (string, error) {
 		scheme, appName, ok := strings.Cut(addr, ":")
 		if !ok || scheme != appc.DNSAddrScheme {
 			return "", fmt.Errorf("unexpected conn25 scheme %q", scheme)
@@ -195,11 +196,11 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 
 	// Set up the DNS manager to rewrite responses for app domains
 	// to answer with Magic IPs.
-	dnsManager.SetQueryResponseMapper(func(bs []byte) []byte {
+	dnsManager.SetQueryResponseMapper(func(res *resolver.Response) []byte {
 		if !e.conn25.isConfigured() {
-			return bs
+			return res.Bs
 		}
-		return e.conn25.mapDNSResponse(bs)
+		return e.conn25.mapDNSResponse(res)
 	})
 
 	// Intercept packets from the tun device and from WireGuard
@@ -1017,11 +1018,23 @@ var (
 	)
 )
 
+// Question types whose upstream answers we write through instead of rewriting or dropping them.
+var passThroughQuestionTypes = set.Of(
+	// Types used for Email traffic.
+	dnsmessage.TypeMX,
+	dnsmessage.TypeTXT,
+
+	// Types used for VOIP traffic.
+	dnsmessage.TypeSRV,
+	dnsmessage.Type(35), // NAPTR
+)
+
 // mapDNSResponse parses and inspects the DNS response. If the domain
 // is determined to belong to app this node is client for, it assigns addresses
 // for connecting and rewrites the response to contain Magic IPs.
-func (c *Conn25) mapDNSResponse(buf []byte) []byte {
+func (c *Conn25) mapDNSResponse(res *resolver.Response) []byte {
 	var p dnsmessage.Parser
+	buf := res.Bs
 	hdr, err := p.Start(buf)
 	if err != nil {
 		return buf
@@ -1057,13 +1070,19 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 	// There is guaranteed to be at least one matching app, so just take the first one for now
 	appName := appNames[0]
 
+	// Write through record types we are sure are unrelated to conn25, as we try our best not to break
+	// user's application. If this causes problems in the future, it could be reasonable to not write through anything.
+	if passThroughQuestionTypes.Contains(question.Type) {
+		return buf
+	}
+
 	// Now we know this is a dns response we think we should rewrite, we're going to provide our response which
 	// currently means we will:
-	//  * write the questions through as they are
-	//  * not send through the additional section
-	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
-	//   * We handle A, AAAA and HTTPS type questions
-	//   * We drop all others
+	//  * Write the questions through as they are
+	//  * Not send through the additional section
+	//  * Provide our answers, or no answers if we don't handle those answers
+	//  * We handle A, AAAA and HTTPS type questions
+	//  * We drop all others
 
 	// Question Type HTTPS
 	if question.Type == dnsmessage.TypeHTTPS {
